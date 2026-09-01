@@ -2,63 +2,134 @@
  * DYNAMIC GROUP TRAVEL EXPENSE SPLITTER
  * ------------------------------------------------------------------
  * Custom Menu: "Expense Splitter" (PC only - menus do NOT appear in
- * the Google Sheets mobile app. On mobile, everything works via
- * checkboxes + automatic onEdit triggers.)
+ * the Google Sheets mobile app. On mobile, use the
+ * "All Expenses Confirmed" checkbox on the Setup sheet.)
  *
  * INSTALL:
  *   1. Extensions -> Apps Script -> paste this file -> Save
- *   2. Run setup() once and authorize the requested scopes
- *      (MailApp scope is required to send emails; emails are sent
- *      from the Google account that runs the function)
+ *   2. Run setup() once and authorize ALL requested scopes
+ *      (including "Send email as you" - required for reports)
  *   3. Reload the spreadsheet to see the "Expense Splitter" menu
  *
- * EXPENSE FLOW:
- *   - Add expense rows on the "Expenses" sheet
- *   - Tick the "Confirm?" checkbox (works on mobile) OR use menu
- *     "Confirm Selected Rows" / "Confirm All Rows" (PC)
- *   - Per-person columns + TOTAL row only count CONFIRMED rows
- *   - Menu "Send PDF Reports via Email" emails each person only the
- *     confirmed expenses that involve them + their settlement plan
+ * CONFIRM FLOW (single switch, not per-row):
+ *   - Enter all expense rows on "Expenses" (no totals shown yet)
+ *   - When done: tick Setup -> "All Expenses Confirmed" (B6)
+ *     OR PC menu: Expense Splitter -> Confirm All Expenses
+ *     OR assign confirmAllExpenses to an Insert -> Drawing button
+ *   - Per-person columns + TOTAL row appear on the Expenses tab
+ *   - Untick / "Re-open for Editing" hides totals again
+ *
+ * NOTE: the TOTAL label lives in the Description column because
+ * column A has strict date validation which also blocks script writes.
+ *
+ * TROUBLESHOOTING:
+ *   - "Fix Expenses Sheet Formatting" wipes stray formatting/validation
+ *   - "Diagnose" reports the state of every moving part
  */
 
 const SHEET_SETUP = "Setup";
 const SHEET_EXPENSES = "Expenses";
 const SHEET_REPORTS = "Send Reports";
 
-const COL = { DATE: 1, DESC: 2, AMOUNT: 3, PAID_BY: 4, SPLIT: 5, CONFIRM: 6 };
-const FIRST_PERSON_COL = 7; // person share columns start at column G
+const COL = { DATE: 1, DESC: 2, AMOUNT: 3, PAID_BY: 4, SPLIT: 5 };
+const FIRST_PERSON_COL = 6; // person share columns start at column F
 const MAX_DATA_ROWS = 500;
+const CONFIRM_CELL = "B6"; // Setup sheet master confirm checkbox
+const TOTAL_LABEL = "TOTAL"; // written to Description col (B), never Date col (A)
 
 const COLOR = {
   HEADER: "#0F766E",
   HEADER_DARK: "#1E293B",
   HEADER_MID: "#334155",
-  PENDING: "#FEF3C7",   // amber for unconfirmed rows
   TOTAL_BG: "#E2E8F0",
   GREEN_BG: "#D1FAE5", GREEN_TX: "#065F46",
   RED_BG: "#FEE2E2",   RED_TX: "#991B1B",
-  GRAY_BG: "#F3F4F6",  GRAY_TX: "#374151"
+  GRAY_BG: "#F3F4F6",  GRAY_TX: "#374151",
+  WARN_TX: "#B45309",
+  PENDING: "#FEF3C7"
 };
+
+/**
+ * UI-safe alert: getUi() throws without an open spreadsheet UI.
+ * Falls back to a toast, then to the execution log.
+ */
+function safeAlert(message) {
+  try {
+    SpreadsheetApp.getUi().alert(message);
+    return;
+  } catch (e) { /* no UI context — fall through */ }
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, "Expense Splitter", 10);
+  } catch (e2) {
+    Logger.log(message);
+  }
+}
 
 /**
  * Creates custom menu when the spreadsheet opens (PC / desktop only).
  */
 function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('Expense Splitter')
+  SpreadsheetApp.getUi()
+    .createMenu('Expense Splitter')
     .addItem('1. Initialize / Reset Tracker', 'setup')
     .addItem('2. Recalculate Expenses & Settlements', 'recalculateAll')
     .addSeparator()
-    .addItem('Confirm Selected Rows', 'confirmSelectedExpenses')
-    .addItem('Confirm All Rows', 'confirmAllExpenses')
+    .addItem('Confirm All Expenses', 'confirmAllExpenses')
+    .addItem('Re-open for Editing (Unconfirm)', 'unconfirmExpenses')
     .addSeparator()
     .addItem('3. Send PDF Reports via Email', 'sendPdfReports')
+    .addItem('Test Email Permission', 'testEmailPermission')
+    .addSeparator()
+    .addItem('Fix Expenses Sheet Formatting', 'fixExpensesSheet')
+    .addItem('Diagnose', 'diagnose')
     .addToUi();
 }
 
 /**
+ * Health check: verifies the state of every piece and reports back.
+ */
+function diagnose() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lines = [];
+
+  const setupSheet = ss.getSheetByName(SHEET_SETUP);
+  const expenseSheet = ss.getSheetByName(SHEET_EXPENSES);
+  lines.push(`Setup sheet: ${setupSheet ? "found" : "MISSING"}`);
+  lines.push(`Expenses sheet: ${expenseSheet ? "found" : "MISSING"}`);
+
+  if (setupSheet) {
+    lines.push(`Confirmed checkbox (B6): ${setupSheet.getRange(CONFIRM_CELL).getValue()}`);
+    lines.push(`Setup status: ${setupSheet.getRange("B5").getValue()}`);
+  }
+
+  const roster = getRoster();
+  lines.push(`Roster names: ${roster.length ? roster.map(r => r.name).join(", ") : "NONE"}`);
+
+  if (expenseSheet) {
+    lines.push(`Expense data rows: ${countDataRows_(expenseSheet)}`);
+
+    if (expenseSheet.getLastRow() > 1) {
+      const r = expenseSheet.getRange(2, 1, 1, 5).getValues()[0];
+      lines.push(`Row 2 — Amount: "${r[2]}", Paid By: "${r[3]}", Split Among: "${r[4]}"`);
+    }
+
+    // Write test: can the script write to the person columns?
+    try {
+      const testCell = expenseSheet.getRange(MAX_DATA_ROWS, FIRST_PERSON_COL);
+      const old = testCell.getValue();
+      testCell.setValue("__test__");
+      testCell.setValue(old);
+      lines.push("Write test on person columns: OK");
+    } catch (err) {
+      lines.push(`Write test on person columns: FAILED — ${err.message}`);
+    }
+  }
+
+  safeAlert("DIAGNOSIS:\n\n" + lines.join("\n"));
+}
+
+/**
  * Master initialization function.
- * Builds all sheets, labels, roster table, defaults, and formatting.
  */
 function setup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -67,7 +138,7 @@ function setup() {
   ss.getSheetByName(SHEET_EXPENSES) || ss.insertSheet(SHEET_EXPENSES);
   ss.getSheetByName(SHEET_REPORTS) || ss.insertSheet(SHEET_REPORTS);
 
-  // --- 1. SETUP SHEET CONFIGURATION ---
+  // --- SETUP SHEET CONFIGURATION ---
   setupSheet.clear();
   setupSheet.getRange("A1:B1").merge().setValue("TRIP CONFIGURATION")
     .setBackground(COLOR.HEADER_DARK).setFontColor("#FFFFFF").setFontWeight("bold");
@@ -76,10 +147,16 @@ function setup() {
     ["Trip Name / Destination:", "Goa Vacation 2026"],
     ["Number of People:", 4],
     ["Currency Symbol:", "₹"],
-    ["Setup Status:", "Checking..."]
+    ["Setup Status:", "Checking..."],
+    ["All Expenses Confirmed:", false]
   ];
-  setupSheet.getRange("A2:B5").setValues(configLabels);
-  setupSheet.getRange("A2:A5").setFontWeight("bold");
+  setupSheet.getRange("A2:B6").setValues(configLabels);
+  setupSheet.getRange("A2:A6").setFontWeight("bold");
+
+  // Master confirm checkbox (mobile-friendly; menus are PC-only)
+  setupSheet.getRange(CONFIRM_CELL).insertCheckboxes();
+  setupSheet.getRange("A6").setNote(
+    "Tick this AFTER entering all expenses. Totals and per-person splits appear only while this is ticked.");
 
   // Number of people: true dropdown listing 2 to 15
   const peopleOptions = [];
@@ -91,8 +168,8 @@ function setup() {
     .build();
   setupSheet.getRange("B3").setDataValidation(numPeopleRule);
 
-  // Roster header — Email is OPTIONAL (only needed if you want PDF reports emailed)
-  setupSheet.getRange("A7:C7").setValues([["#", "Name", "Email (optional)"]])
+  // Roster header — Email is OPTIONAL (needed only for PDF reports)
+  setupSheet.getRange("A8:C8").setValues([["#", "Name", "Email (optional)"]])
     .setBackground(COLOR.HEADER_MID).setFontColor("#FFFFFF").setFontWeight("bold");
 
   const initialRoster = [
@@ -101,29 +178,32 @@ function setup() {
     [3, "Amit", ""],
     [4, "Neha", ""]
   ];
-  setupSheet.getRange(8, 1, initialRoster.length, 3).setValues(initialRoster);
+  setupSheet.getRange(9, 1, initialRoster.length, 3).setValues(initialRoster);
 
   applyRobotoFont(setupSheet);
   setupSheet.autoResizeColumns(1, 3);
 
-  // --- 2. INITIALIZE EXPENSES & REPORTS ---
   validateSetupStatus();
   updateExpensesStructure();
   recalculateAll();
 
-  SpreadsheetApp.getUi().alert("Setup complete! Edit your Trip details and Roster in the 'Setup' tab.");
+  safeAlert("Setup complete! Edit your Trip details and Roster in the 'Setup' tab.");
 }
 
-/**
- * Helper to apply Roboto 12pt across a given sheet.
- */
 function applyRobotoFont(sheet) {
   sheet.getDataRange().setFontFamily("Roboto").setFontSize(12);
 }
 
 /**
+ * True only when the master "All Expenses Confirmed" checkbox is ticked.
+ */
+function isExpensesConfirmed() {
+  const setupSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SETUP);
+  return setupSheet ? setupSheet.getRange(CONFIRM_CELL).getValue() === true : false;
+}
+
+/**
  * Validates trip config & roster names (emails are OPTIONAL).
- * Updates the status cell B5 in Setup. Returns true if usable.
  */
 function validateSetupStatus() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -148,13 +228,13 @@ function validateSetupStatus() {
     return false;
   }
 
-  const rosterData = setupSheet.getRange(8, 1, numPeople, 3).getValues();
+  const rosterData = setupSheet.getRange(9, 1, numPeople, 3).getValues();
   const names = [];
   let namedCount = 0;
 
   for (let i = 0; i < numPeople; i++) {
     const name = String(rosterData[i][1]).trim();
-    if (!name) continue; // unnamed rows simply don't get a column yet
+    if (!name) continue;
     namedCount++;
     if (names.includes(name.toLowerCase())) {
       statusCell.setValue(`❌ Duplicate name found: "${name}"`).setFontColor(COLOR.RED_TX).setFontWeight("normal");
@@ -165,7 +245,7 @@ function validateSetupStatus() {
 
   if (namedCount < numPeople) {
     statusCell.setValue(`⚠️ ${namedCount} of ${numPeople} people named — fill all names`)
-      .setFontColor("#B45309").setFontWeight("normal");
+      .setFontColor(COLOR.WARN_TX).setFontWeight("normal");
     return false;
   }
 
@@ -174,8 +254,7 @@ function validateSetupStatus() {
 }
 
 /**
- * Reads the roster from Setup. Only rows WITH a name are returned,
- * so unnamed placeholder rows never become expense columns.
+ * Roster from Setup (rows 9+). Only rows WITH a name are returned.
  */
 function getRoster() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -185,7 +264,7 @@ function getRoster() {
   const numPeople = parseInt(setupSheet.getRange("B3").getValue(), 10) || 0;
   if (numPeople === 0) return [];
 
-  const rawData = setupSheet.getRange(8, 1, numPeople, 3).getValues();
+  const rawData = setupSheet.getRange(9, 1, numPeople, 3).getValues();
   const roster = [];
   rawData.forEach(row => {
     const name = String(row[1]).trim();
@@ -195,8 +274,7 @@ function getRoster() {
 }
 
 /**
- * Parses the "Split Among" cell into a list of roster names.
- * Blank or "All" = everyone. Otherwise comma-separated names.
+ * Parses "Split Among": blank or "All" = everyone, else comma-separated names.
  */
 function parseIncluded(splitStr, names) {
   const s = String(splitStr).trim();
@@ -207,30 +285,26 @@ function parseIncluded(splitStr, names) {
 
 /**
  * Simple trigger: reacts to edits on Setup and Expenses.
- * NOTE: UI dialogs (alerts/msgBox) are NOT allowed in simple triggers,
- * so structural changes apply immediately without a prompt.
  */
 function onEdit(e) {
   if (!e) return;
+  const a1 = e.range.getA1Notation();
   const sheetName = e.range.getSheet().getName();
 
   if (sheetName === SHEET_SETUP) {
-    if (e.range.getA1Notation() === "B3") {
-      adjustRosterRows(); // also removes extra person columns via updateExpensesStructure below
-    }
+    if (a1 === "B3") adjustRosterRows();
+    if (a1 === CONFIRM_CELL) { recalculateAll(); return; } // master confirm toggled
     validateSetupStatus();
     updateExpensesStructure();
     recalculateAll();
   } else if (sheetName === SHEET_EXPENSES) {
-    // Don't rebuild structure if the edit was in a computed person column
     recalculateAll();
   }
 }
 
 /**
- * Adjusts the Roster table row count in Setup to match N (cell B3).
- * New rows start with a BLANK name so they don't create expense columns
- * until a real name is typed.
+ * Adjusts Roster rows in Setup to match N (cell B3).
+ * New rows start with a BLANK name (no expense column until named).
  */
 function adjustRosterRows() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -238,18 +312,17 @@ function adjustRosterRows() {
   const targetN = parseInt(setupSheet.getRange("B3").getValue(), 10);
   if (!targetN) return;
 
-  const currentRosterCount = Math.max(0, setupSheet.getLastRow() - 7);
+  const currentRosterCount = Math.max(0, setupSheet.getLastRow() - 8);
 
   if (targetN > currentRosterCount) {
     const rowsToAdd = targetN - currentRosterCount;
     const newRows = [];
     for (let i = 1; i <= rowsToAdd; i++) {
-      const nextId = currentRosterCount + i;
-      newRows.push([nextId, "", ""]); // blank name on purpose
+      newRows.push([currentRosterCount + i, "", ""]);
     }
-    setupSheet.getRange(8 + currentRosterCount, 1, rowsToAdd, 3).setValues(newRows);
+    setupSheet.getRange(9 + currentRosterCount, 1, rowsToAdd, 3).setValues(newRows);
   } else if (targetN < currentRosterCount) {
-    setupSheet.deleteRows(8 + targetN, currentRosterCount - targetN);
+    setupSheet.deleteRows(9 + targetN, currentRosterCount - targetN);
   }
 
   applyRobotoFont(setupSheet);
@@ -257,9 +330,42 @@ function adjustRosterRows() {
 }
 
 /**
- * Rebuilds headers, validations, checkboxes and formats on Expenses.
- * Also REMOVES leftover person columns when the roster shrinks
- * (e.g. count changed 5 -> 3 removes the last 2 columns entirely).
+ * ONE-TIME CLEANER: wipes ALL content, formatting and validations
+ * below the Expenses header row, then rebuilds.
+ * (Keeps the header row; re-enter your rows afterwards.)
+ */
+function fixExpensesSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const expenseSheet = ss.getSheetByName(SHEET_EXPENSES);
+  if (!expenseSheet) return;
+
+  clearAllProtections(expenseSheet);
+
+  if (expenseSheet.getMaxRows() > 1) {
+    expenseSheet
+      .getRange(2, 1, expenseSheet.getMaxRows() - 1, expenseSheet.getMaxColumns())
+      .clearContent().clearFormat().clearDataValidations();
+  }
+
+  updateExpensesStructure();
+  recalculateAll();
+  safeAlert("Expenses sheet cleaned. Re-enter your expense rows.");
+}
+
+/**
+ * Removes every range protection on a sheet (best effort).
+ */
+function clearAllProtections(sheet) {
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
+    try { p.remove(); } catch (e) { /* not ours — ignore */ }
+  });
+}
+
+/**
+ * Rebuilds headers, validations and formats on Expenses.
+ * Removes leftover person columns when the roster shrinks (5 -> 3 etc),
+ * and normalizes person columns (clears stale checkbox validation and
+ * any colored fills left by older versions).
  */
 function updateExpensesStructure() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -268,13 +374,15 @@ function updateExpensesStructure() {
 
   const roster = getRoster();
   const names = roster.map(r => r.name);
-  const headers = ["Date", "Description", "Amount", "Paid By", "Split Among", "Confirm?", ...names];
+  const headers = ["Date", "Description", "Amount", "Paid By", "Split Among", ...names];
   const newWidth = headers.length;
 
-  // Remove protections so structure can be modified
-  expenseSheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
+  clearAllProtections(expenseSheet);
 
-  // Clear leftover columns from a previous wider roster
+  const currencySymbol = ss.getSheetByName(SHEET_SETUP).getRange("B4").getValue() || "₹";
+  const currencyFormat = `"${currencySymbol}"#,##0.00`;
+
+  // 1. Wipe leftover columns from a previous wider roster
   const oldWidth = expenseSheet.getLastColumn();
   if (oldWidth > newWidth) {
     expenseSheet
@@ -282,12 +390,24 @@ function updateExpensesStructure() {
       .clearContent().clearFormat().clearDataValidations();
   }
 
-  // Headers
+  // 2. Normalize the person-column band (F..end): person columns are
+  //    script-computed — no validation, no fills, plain currency cells.
+  if (names.length > 0) {
+    expenseSheet
+      .getRange(2, FIRST_PERSON_COL, MAX_DATA_ROWS, names.length)
+      .clearDataValidations()
+      .setBackground("#FFFFFF")
+      .setFontColor("#000000")
+      .setFontWeight("normal")
+      .setNumberFormat(currencyFormat);
+  }
+
+  // 3. Headers
   expenseSheet.getRange(1, 1, 1, newWidth).setValues([headers])
     .setBackground(COLOR.HEADER).setFontColor("#FFFFFF").setFontWeight("bold");
   expenseSheet.setFrozenRows(1);
 
-  // Date validation on the Date column (works on mobile + PC)
+  // 4. Date validation (mobile + PC)
   const dateRule = SpreadsheetApp.newDataValidation()
     .requireDate()
     .setAllowInvalid(false)
@@ -295,7 +415,7 @@ function updateExpensesStructure() {
     .build();
   expenseSheet.getRange(2, COL.DATE, MAX_DATA_ROWS, 1).setDataValidation(dateRule);
 
-  // "Paid By" dropdown from current roster names
+  // 5. "Paid By" dropdown from current roster names
   if (names.length > 0) {
     const paidByRule = SpreadsheetApp.newDataValidation()
       .requireValueInList(names, true)
@@ -306,12 +426,7 @@ function updateExpensesStructure() {
     expenseSheet.getRange(2, COL.PAID_BY, MAX_DATA_ROWS, 1).clearDataValidations();
   }
 
-  // "Confirm?" checkboxes — the mobile-friendly confirm button
-  expenseSheet.getRange(2, COL.CONFIRM, MAX_DATA_ROWS, 1).insertCheckboxes();
-
-  // Formats
-  const currencySymbol = ss.getSheetByName(SHEET_SETUP).getRange("B4").getValue() || "₹";
-  const currencyFormat = `"${currencySymbol}"#,##0.00`;
+  // 6. Formats for input columns
   expenseSheet.getRange(2, COL.DATE, MAX_DATA_ROWS, 1).setNumberFormat("dd-mmm-yyyy");
   expenseSheet.getRange(2, COL.AMOUNT, MAX_DATA_ROWS, 1).setNumberFormat(currencyFormat);
 
@@ -320,24 +435,40 @@ function updateExpensesStructure() {
 }
 
 /**
- * Returns the last data row on the Expenses sheet, and removes any
- * existing TOTAL row. Person column count is respected.
+ * True if the given row is the TOTAL summary row.
+ * The label sits in column B because column A enforces date validation
+ * (which rejects script writes too).
  */
-function stripTotalRow(expenseSheet) {
-  let lastRow = expenseSheet.getLastRow();
-  if (lastRow > 1) {
-    const firstCell = String(expenseSheet.getRange(lastRow, 1).getValue()).toUpperCase();
-    if (firstCell.indexOf("TOTAL") === 0) {
-      expenseSheet.deleteRow(lastRow);
-      lastRow--;
-    }
-  }
-  return lastRow; // last row of actual data (1 = no data)
+function isTotalRow_(sheet, rowIndex) {
+  const a = String(sheet.getRange(rowIndex, COL.DATE).getValue()).toUpperCase();
+  const b = String(sheet.getRange(rowIndex, COL.DESC).getValue()).toUpperCase();
+  return a.indexOf(TOTAL_LABEL) === 0 || b.indexOf(TOTAL_LABEL) === 0;
 }
 
 /**
- * Core recalculation: per-person share columns + TOTAL row.
- * ONLY rows with Confirm? = TRUE are calculated and totalled.
+ * Number of real data rows (excludes header and any TOTAL row).
+ */
+function countDataRows_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  return isTotalRow_(sheet, lastRow) ? lastRow - 2 : lastRow - 1;
+}
+
+/**
+ * Returns last data row, deleting any existing TOTAL row first.
+ */
+function stripTotalRow(expenseSheet) {
+  let lastRow = expenseSheet.getLastRow();
+  if (lastRow > 1 && isTotalRow_(expenseSheet, lastRow)) {
+    expenseSheet.deleteRow(lastRow);
+    lastRow--;
+  }
+  return lastRow;
+}
+
+/**
+ * Core recalculation. Person shares + TOTAL row appear ONLY when the
+ * master "All Expenses Confirmed" checkbox (Setup!B6) is ticked.
  */
 function recalculateAll() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -351,38 +482,33 @@ function recalculateAll() {
 
   const currencySymbol = setupSheet.getRange("B4").getValue() || "₹";
   const currencyFormat = `"${currencySymbol}"#,##0.00`;
+  const width = COL.SPLIT + names.length;
 
   const dataLastRow = stripTotalRow(expenseSheet);
+  const confirmed = isExpensesConfirmed();
 
-  let totalAmount = 0;
-  const personTotals = new Array(names.length).fill(0);
-
-  if (dataLastRow >= 2) {
-    const width = COL.CONFIRM + names.length; // A..F + person cols
+  if (dataLastRow >= 2 && confirmed) {
     const data = expenseSheet.getRange(2, 1, dataLastRow - 1, width).getValues();
     const shareMatrix = [];
-    const rowBackgrounds = [];
+    let totalAmount = 0;
+    const personTotals = new Array(names.length).fill(0);
 
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
       const amount = parseFloat(row[COL.AMOUNT - 1]) || 0;
       const paidBy = String(row[COL.PAID_BY - 1]).trim();
-      const confirmed = row[COL.CONFIRM - 1] === true;
-
       const rowNet = new Array(names.length).fill("");
 
-      if (confirmed && amount > 0 && paidBy) {
+      if (amount > 0 && paidBy) {
         const included = parseIncluded(row[COL.SPLIT - 1], names);
-
         if (included.length > 0) {
-          // Equal split, 2-decimal precision, remainder goes to the payer
+          // Equal split, 2-decimal precision, remainder to the payer
           const baseShare = Math.floor((amount / included.length) * 100) / 100;
           const remainder = Math.round((amount - baseShare * included.length) * 100) / 100;
 
           names.forEach((name, idx) => {
             const consumed = included.includes(name)
-              ? baseShare + (name === paidBy ? remainder : 0)
-              : 0;
+              ? baseShare + (name === paidBy ? remainder : 0) : 0;
             const paid = (name === paidBy) ? amount : 0;
             rowNet[idx] = Math.round((paid - consumed) * 100) / 100;
             personTotals[idx] = Math.round((personTotals[idx] + rowNet[idx]) * 100) / 100;
@@ -390,85 +516,48 @@ function recalculateAll() {
           totalAmount = Math.round((totalAmount + amount) * 100) / 100;
         }
       }
-
       shareMatrix.push(rowNet);
-      // Amber background = pending confirmation, white = confirmed
-      const bg = confirmed ? "#FFFFFF" : COLOR.PENDING;
-      rowBackgrounds.push(new Array(COL.CONFIRM).fill(bg));
     }
 
-    // Write per-person shares
     const shareRange = expenseSheet.getRange(2, FIRST_PERSON_COL, shareMatrix.length, names.length);
-    shareRange.setValues(shareMatrix).setNumberFormat(currencyFormat).setBackground("#FFFFFF");
+    shareRange.setValues(shareMatrix).setNumberFormat(currencyFormat);
 
-    // Highlight input area by confirmation state
-    expenseSheet.getRange(2, 1, shareMatrix.length, COL.CONFIRM).setBackgrounds(rowBackgrounds);
-
-    // TOTAL row (confirmed rows only) — written as static values
+    // TOTAL row — label in Description (B); Date col (A) stays empty
+    // because its date validation rejects non-date writes, even from scripts.
     const totalsRowIndex = dataLastRow + 1;
-    const totalsRow = ["TOTAL (Confirmed)", "", totalAmount, "", "", ""].concat(personTotals);
+    const totalsRow = ["", TOTAL_LABEL, totalAmount, "", ""].concat(personTotals);
     expenseSheet.getRange(totalsRowIndex, 1, 1, width).setValues([totalsRow])
       .setBackground(COLOR.TOTAL_BG).setFontWeight("bold");
     expenseSheet.getRange(totalsRowIndex, COL.AMOUNT).setNumberFormat(currencyFormat);
     expenseSheet.getRange(totalsRowIndex, FIRST_PERSON_COL, 1, names.length).setNumberFormat(currencyFormat);
+
+  } else if (dataLastRow >= 2 && !confirmed) {
+    // Not confirmed: keep rows, but hide all computed values
+    expenseSheet.getRange(2, FIRST_PERSON_COL, dataLastRow - 1, names.length).clearContent();
   }
 
-  protectExpensesSheet(expenseSheet, names.length);
   updateSendReportsSheet();
 }
 
 /**
- * Protects header row, computed person columns and the TOTAL row.
- * Input columns (Date..Confirm?) stay editable for everyone.
- */
-function protectExpensesSheet(sheet, numPeople) {
-  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => p.remove());
-
-  const headerProt = sheet.getRange(1, 1, 1, COL.CONFIRM + numPeople).protect()
-    .setDescription("Header Protection");
-  headerProt.removeEditors(headerProt.getEditors());
-
-  const lastRow = Math.max(sheet.getLastRow(), 2);
-  const shareProt = sheet.getRange(2, FIRST_PERSON_COL, lastRow - 1, numPeople).protect()
-    .setDescription("Per-person Formula Protection");
-  shareProt.removeEditors(shareProt.getEditors());
-}
-
-/**
- * CONFIRM HELPERS
- * confirmAllExpenses: ticks every data row (also assignable to a
- * drawing/image button via right-click -> Assign script).
+ * CONFIRM HELPERS — one switch for everything.
+ * confirmAllExpenses is assignable to an Insert -> Drawing button.
  */
 function confirmAllExpenses() {
-  const expenseSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_EXPENSES);
-  if (!expenseSheet) return;
-  const dataLastRow = stripTotalRow(expenseSheet);
-  if (dataLastRow < 2) return;
-  expenseSheet.getRange(2, COL.CONFIRM, dataLastRow - 1, 1).setValue(true);
+  SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SETUP)
+    .getRange(CONFIRM_CELL).setValue(true);
+  recalculateAll();
+}
+
+function unconfirmExpenses() {
+  SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SETUP)
+    .getRange(CONFIRM_CELL).setValue(false);
   recalculateAll();
 }
 
 /**
- * Ticks only the currently selected rows on the Expenses sheet.
- */
-function confirmSelectedExpenses() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const range = ss.getActiveRange();
-  if (!range || range.getSheet().getName() !== SHEET_EXPENSES) {
-    SpreadsheetApp.getUi().alert("Select one or more expense rows on the 'Expenses' sheet first.");
-    return;
-  }
-  const expenseSheet = ss.getSheetByName(SHEET_EXPENSES);
-  const dataLastRow = stripTotalRow(expenseSheet);
-  const startRow = Math.max(2, range.getRow());
-  const endRow = Math.min(dataLastRow, range.getLastRow());
-  if (endRow < startRow) return;
-  expenseSheet.getRange(startRow, COL.CONFIRM, endRow - startRow + 1, 1).setValue(true);
-  recalculateAll();
-}
-
-/**
- * Reads CONFIRMED expense rows as objects shared by reports & emails.
+ * Expense rows as objects. Returns ZERO rows while unconfirmed,
+ * so totals/reports stay hidden until the master switch is ticked.
  */
 function getConfirmedExpenses() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -476,16 +565,16 @@ function getConfirmedExpenses() {
   const roster = getRoster();
   const names = roster.map(r => r.name);
   if (!expenseSheet || names.length === 0) return { expenses: [], roster, names };
+  if (!isExpensesConfirmed()) return { expenses: [], roster, names };
 
   const dataLastRow = stripTotalRow(expenseSheet);
   if (dataLastRow < 2) return { expenses: [], roster, names };
 
-  const data = expenseSheet.getRange(2, 1, dataLastRow - 1, COL.CONFIRM + names.length).getValues();
+  const data = expenseSheet.getRange(2, 1, dataLastRow - 1, COL.SPLIT + names.length).getValues();
   const tz = ss.getSpreadsheetTimeZone();
   const expenses = [];
 
   data.forEach(row => {
-    if (row[COL.CONFIRM - 1] !== true) return; // skip unconfirmed
     const amount = parseFloat(row[COL.AMOUNT - 1]) || 0;
     const paidBy = String(row[COL.PAID_BY - 1]).trim();
     if (amount <= 0 || !paidBy) return;
@@ -507,8 +596,7 @@ function getConfirmedExpenses() {
 }
 
 /**
- * Per-person totals across confirmed expenses.
- * share = what they consumed, paid = what they fronted.
+ * Per-person totals across expenses.
  */
 function computeTotals(expenses, names) {
   const totals = {};
@@ -536,7 +624,7 @@ function computeTotals(expenses, names) {
 }
 
 /**
- * Populates Summary & Simplified Settlements on the "Send Reports" sheet.
+ * Populates Summary & Simplified Settlements on "Send Reports".
  */
 function updateSendReportsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -547,11 +635,19 @@ function updateSendReportsSheet() {
 
   reportsSheet.clear();
 
+  // Banner if not confirmed yet
+  if (!isExpensesConfirmed()) {
+    reportsSheet.getRange("A1:F1").merge()
+      .setValue("⚠️ Expenses not confirmed yet — tick 'All Expenses Confirmed' on the Setup sheet to see totals and send reports.")
+      .setBackground(COLOR.PENDING).setFontColor(COLOR.WARN_TX).setFontWeight("bold");
+    reportsSheet.autoResizeColumns(1, 6);
+    return;
+  }
+
   const { expenses, roster, names } = getConfirmedExpenses();
   const totals = computeTotals(expenses, names);
 
-  // --- 1. SUMMARY TABLE ---
-  reportsSheet.getRange("A1:F1").merge().setValue("PERSONAL BALANCES SUMMARY (confirmed expenses only)")
+  reportsSheet.getRange("A1:F1").merge().setValue("PERSONAL BALANCES SUMMARY")
     .setBackground(COLOR.HEADER_DARK).setFontColor("#FFFFFF").setFontWeight("bold");
 
   reportsSheet.getRange("A2:F2")
@@ -565,8 +661,7 @@ function updateSendReportsSheet() {
   });
 
   if (summaryData.length > 0) {
-    const summaryRange = reportsSheet.getRange(3, 1, summaryData.length, 6);
-    summaryRange.setValues(summaryData);
+    reportsSheet.getRange(3, 1, summaryData.length, 6).setValues(summaryData);
     reportsSheet.getRange(3, 3, summaryData.length, 3).setNumberFormat(currencyFormat);
 
     for (let i = 0; i < summaryData.length; i++) {
@@ -578,7 +673,6 @@ function updateSendReportsSheet() {
     }
   }
 
-  // --- 2. SIMPLIFIED SETTLEMENTS (greedy, minimizes transactions) ---
   const balancesMap = {};
   names.forEach(n => balancesMap[n] = totals[n].net);
   const settlements = calculateGreedySettlements(balancesMap);
@@ -643,14 +737,45 @@ function calculateGreedySettlements(balances) {
 }
 
 /**
+ * Sends a plain test email to the account running the script.
+ * Use this FIRST to verify the "Send email as you" permission is granted.
+ */
+function testEmailPermission() {
+  let addr = Session.getActiveUser().getEmail();
+
+  if (!addr) {
+    try {
+      const ui = SpreadsheetApp.getUi();
+      const resp = ui.prompt("Test Email", "Enter your email address:", ui.ButtonSet.OK_CANCEL);
+      if (resp.getSelectedButton() !== ui.Button.OK) return;
+      addr = resp.getResponseText().trim();
+    } catch (e) {
+      safeAlert("Could not detect your email automatically. Open the spreadsheet on a computer and use the menu: Expense Splitter → Test Email Permission.");
+      return;
+    }
+  }
+
+  try {
+    MailApp.sendEmail(addr, "Expense Splitter — Test",
+      "If you can read this, the script has permission to send email as you.");
+    safeAlert(`✅ Test email sent to ${addr}.\n\nSender = the Google account you are logged in with.\nCheck inbox AND spam.`);
+  } catch (err) {
+    safeAlert(`❌ Test FAILED:\n\n${err.message}\n\nFix: run any function from the Apps Script editor and approve the "Send email as you" permission.`);
+  }
+}
+
+/**
  * Generates a personalized PDF per person and emails it.
- * Emails are sent FROM the Google account running this function.
- * People without a valid email are skipped and logged in Sheet 3.
+ * Sender = the Google account running this function.
+ * People without a valid email are skipped (logged in Sheet 3).
  */
 function sendPdfReports() {
-  const ui = SpreadsheetApp.getUi();
   if (!validateSetupStatus()) {
-    ui.alert("Cannot send reports: Setup is incomplete. Check the 'Setup' tab status cell.");
+    safeAlert("Cannot send reports: Setup is incomplete. Check the 'Setup' tab status cell.");
+    return;
+  }
+  if (!isExpensesConfirmed()) {
+    safeAlert("Expenses are not confirmed yet. Tick 'All Expenses Confirmed' on the Setup sheet first.");
     return;
   }
 
@@ -664,7 +789,7 @@ function sendPdfReports() {
 
   const { expenses, roster, names } = getConfirmedExpenses();
   if (expenses.length === 0) {
-    ui.alert("No confirmed expenses found. Tick the Confirm? checkbox on at least one row first.");
+    safeAlert("No expense rows found on the 'Expenses' sheet.");
     return;
   }
 
@@ -675,13 +800,13 @@ function sendPdfReports() {
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   let sentCount = 0, skippedCount = 0;
+  const failures = [];
 
   roster.forEach((person, idx) => {
     const statusCell = reportsSheet.getRange(3 + idx, 6);
     try {
-      // Skip people without a usable email instead of failing everyone
       if (!person.email || !emailRegex.test(person.email)) {
-        statusCell.setValue("Skipped (no email)").setFontColor("#B45309");
+        statusCell.setValue("Skipped (no email)").setFontColor(COLOR.WARN_TX);
         skippedCount++;
         return;
       }
@@ -788,8 +913,12 @@ function sendPdfReports() {
 
     } catch (err) {
       statusCell.setValue(`Failed: ${err.message}`).setFontColor(COLOR.RED_TX);
+      failures.push(`${person.name}: ${err.message}`);
     }
   });
 
-  ui.alert(`Done! Sent: ${sentCount}, Skipped (no email): ${skippedCount}, Failed: ${roster.length - sentCount - skippedCount}.\n\nNote: emails are sent FROM the Google account that ran this function — check that account's Sent folder.`);
+  let msg = `Done! Sent: ${sentCount}, Skipped (no email): ${skippedCount}, Failed: ${failures.length}.`;
+  if (failures.length > 0) msg += `\n\nFailure reasons:\n• ${failures.join("\n• ")}`;
+  msg += `\n\nNote: emails are sent FROM the Google account that ran this function — check that account's Sent folder.`;
+  safeAlert(msg);
 }
