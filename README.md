@@ -89,23 +89,6 @@ Automated per-person matrix calculations, greedy debt minimization, and 1-click 
 
 ---
 
-### Option C: Developer Setup with Clasp
-
-# Clone the repository
-```bash
-git clone [https://github.com/Yash19815/dynamic-travel-expense-splitter.git](https://github.com/Yash19815/dynamic-travel-expense-splitter.git)
-cd dynamic-travel-expense-splitter
-```
-# Install Google Clasp globally
-```
-npm install -g @google/clasp
-```
-# Login and create/push to your Google Apps Script project
-```
-clasp login
-clasp create --title "Travel Expense Splitter" --type sheets
-clasp push
-```
 ⚙️ How It Works
 1. Equal & Partial Splits
 In the Expenses tab, enter the expenditure details:
