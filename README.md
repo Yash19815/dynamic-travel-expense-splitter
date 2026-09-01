@@ -105,8 +105,6 @@ Instead of N \times (N-1) individual payments, the system matches net creditors 
 📂 Project Architecture
 ```
 dynamic-travel-expense-splitter/
-├── .clasp.json               # Google Apps Script Clasp CLI config
-├── appsscript.json           # Apps Script manifest & scope authorizations
 ├── main_optimized.gs         # Production-ready Apps Script engine
 ├── README.md                 # Project documentation
 ├── LICENSE                   # MIT License
