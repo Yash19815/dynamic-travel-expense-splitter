@@ -22,7 +22,7 @@ Automated per-person matrix calculations, greedy debt minimization, and 1-click 
 
 <br /><br />
 
-[**🚀 Click Here to Make a Copy in Google Drive**](https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID_HERE/copy)  
+[**🚀 Click Here to Make a Copy in Google Drive**](https://docs.google.com/spreadsheets/d/11dY2B2j1dNIRlWfagUtbX13LRmW894mhnhCGBVsx9oQ/copy)  
 *(No installation required for non-technical users)*
 
 </div>
@@ -73,7 +73,7 @@ Automated per-person matrix calculations, greedy debt minimization, and 1-click 
 ## ⚡ Quick Start
 
 ### Option A: 1-Click Google Sheet Template (Easiest)
-1. Click the **[Make a Copy Template Link](https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID_HERE/copy)**.
+1. Click the **[Make a Copy Template Link](https://docs.google.com/spreadsheets/d/11dY2B2j1dNIRlWfagUtbX13LRmW894mhnhCGBVsx9oQ/copy)**.
 2. Open the newly created spreadsheet in your Google Drive.
 3. Open the custom **Expense Splitter** menu at the top and select `1. Initialize / Reset Tracker`.
 4. Authorize the Google Apps Script permissions when prompted.
@@ -91,19 +91,21 @@ Automated per-person matrix calculations, greedy debt minimization, and 1-click 
 
 ### Option C: Developer Setup with Clasp
 
-```bash
 # Clone the repository
+```bash
 git clone [https://github.com/Yash19815/dynamic-travel-expense-splitter.git](https://github.com/Yash19815/dynamic-travel-expense-splitter.git)
 cd dynamic-travel-expense-splitter
-
+```
 # Install Google Clasp globally
+```
 npm install -g @google/clasp
-
+```
 # Login and create/push to your Google Apps Script project
+```
 clasp login
 clasp create --title "Travel Expense Splitter" --type sheets
 clasp push
-
+```
 ⚙️ How It Works
 1. Equal & Partial Splits
 In the Expenses tab, enter the expenditure details:
@@ -112,11 +114,13 @@ In the Expenses tab, enter the expenditure details:
  * Remainder Handling: Fractional cents/paisa remainders from division are mathematically allocated to the payer to prevent rounding balance drift.
 2. Minimum Transaction Engine (Greedy Algorithm)
 Instead of N \times (N-1) individual payments, the system matches net creditors and net debtors to minimize settlement transactions:
+```
 [ Debtor List (Sorted Desc) ] <---> [ Creditor List (Sorted Desc) ]
                  |                                    |
                  +-----> Pay Minimum Share Balance ---+
-
+```
 📂 Project Architecture
+```
 dynamic-travel-expense-splitter/
 ├── .clasp.json               # Google Apps Script Clasp CLI config
 ├── appsscript.json           # Apps Script manifest & scope authorizations
@@ -129,14 +133,15 @@ dynamic-travel-expense-splitter/
     ├── expenses-tab.png
     ├── settlements-tab.png
     └── pdf-report.png
-
+```
 🛠️ Configuration Options
+```
 | Setting Cell | Description | Default Value |
-|---|---|---|
 | Setup!B2 | Trip Name / Destination | Goa Vacation 2026 |
 | Setup!B3 | Number of Participants (Dropdown 2–15) | 4 |
 | Setup!B4 | Currency Symbol | ₹ |
 | Setup!B6 | Master Expense Confirmation Toggle | FALSE |
+```
 🤝 Contributing
 Contributions are welcome! Please feel free to open an issue or submit a pull request:
  * Fork the Repository.
